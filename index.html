@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>IP & Device Checker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; background: #f7f8fa; padding: 30px; }
+    .box { background: #fff; border-radius: 14px; max-width: 800px; margin: auto; box-shadow: 0 2px 18px #0002; padding: 36px; }
+    h1 { color: #222; }
+    .section { margin-bottom: 28px; }
+    .title { font-size: 1.1em; font-weight: bold; margin-bottom: 4px; }
+    pre { background: #f0f0f0; border-radius: 7px; padding: 12px; font-size: 0.98em; overflow: auto; }
+    .ok { color: #28a745; }
+    .warn { color: #e67e22; }
+    .danger { color: #e74c3c; }
+    .info { color: #007bff; }
+    .loading { color: #888; }
+    .human { color: #28a745; font-weight: bold; }
+    .bot { color: #e74c3c; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>🔍 IP, Location & Device Emulator Check</h1>
+    <div class="section">
+      <div class="title">IP Address & Location</div>
+      <div><b>IP:</b> <span id="ip" class="loading">Loading...</span></div>
+      <div><b>Status:</b> <span id="vpnProxy" class="loading">Loading...</span></div>
+      <div id="ipDetails"></div>
+    </div>
+    <div class="section">
+      <div class="title">Location (WebRTC, Geolocation, Timezone)</div>
+      <pre id="locationData" class="loading">Loading...</pre>
+    </div>
+    <div class="section">
+      <div class="title">Emulation Detection</div>
+      <pre id="emulation" class="loading">Loading...</pre>
+    </div>
+    <div class="section">
+      <div class="title">Fingerprint Noise & Canvas/WebGL Tests</div>
+      <pre id="noise" class="loading">Loading...</pre>
+    </div>
+    <div class="section">
+      <div class="title">Bot/Emulator Detection (Like Fingerprints.com)</div>
+      <div id="botStatus" class="loading">Analyzing...</div>
+    </div>
+  </div>
+  <script>
+    // ========== IP, VPN/Proxy Check ==========
+    async function getIPInfo() {
+      try {
+        const resp = await fetch('https://ipapi.co/json/');
+        const data = await resp.json();
+        document.getElementById('ip').textContent = data.ip || 'Unknown';
+        let location = `${data.city || ''}, ${data.region || ''}, ${data.country_name || ''}`;
+        let postal = data.postal ? ` (${data.postal})` : '';
+        document.getElementById('ipDetails').textContent =
+          `Location: ${location}${postal}\nOrg: ${data.org || 'Unknown'}\nASN: ${data.asn || 'Unknown'}\nTimezone: ${data.timezone || 'Unknown'}`;
+        // Sederhana: Deteksi VPN/proxy berdasarkan ASN/Org
+        const vpnOrProxy = /vpn|proxy|digitalocean|ovh|linode|aws|google|choopa|vultr|cloud|data/i.test((data.org||'') + (data.asn||''));
+        document.getElementById('vpnProxy').innerHTML =
+          vpnOrProxy
+            ? '<span class="danger">VPN/Proxy/Suspected Hosting</span>'
+            : '<span class="ok">Residential/Normal</span>';
+      } catch (e) {
+        document.getElementById('ip').textContent = 'Unknown';
+        document.getElementById('ipDetails').textContent = 'Failed to load IP/location info';
+        document.getElementById('vpnProxy').innerHTML = '<span class="warn">Unavailable</span>';
+      }
+    }
+
+    // ========== Location: WebRTC, Geolocation, Timezone ==========
+    async function getLocationData() {
+      let webrtcIPs = [];
+      let geo = { lat: null, lon: null, accuracy: null, error: null };
+      if (window.RTCPeerConnection) {
+        try {
+          const pc = new RTCPeerConnection({iceServers:[]});
+          pc.createDataChannel('');
+          pc.onicecandidate = e => {
+            if (e && e.candidate && e.candidate.candidate) {
+              const m = e.candidate.candidate.match(/([0-9]{1,3}(?:\.[0-9]{1,3}){3})/);
+              if (m) webrtcIPs.push(m[1]);
+            }
+          };
+          await pc.createOffer().then(o => pc.setLocalDescription(o));
+          await new Promise(r=>setTimeout(r, 750));
+          pc.close();
+        } catch {}
+      }
+      await new Promise(resolve => {
+        if (!navigator.geolocation) return resolve();
+        navigator.geolocation.getCurrentPosition(
+          pos => {
+            geo.lat = pos.coords.latitude;
+            geo.lon = pos.coords.longitude;
+            geo.accuracy = pos.coords.accuracy;
+            resolve();
+          },
+          err => {
+            geo.error = err.message;
+            resolve();
+          }, { timeout: 4000 }
+        );
+      });
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      let out = `Timezone: ${tz}\n`;
+      if (webrtcIPs.length) out += `WebRTC IP(s): ${webrtcIPs.join(', ')}\n`;
+      else out += `WebRTC IP(s): (not detected)\n`;
+      if (geo.lat && geo.lon) out += `Geolocation: lat=${geo.lat}, lon=${geo.lon}, acc=${geo.accuracy}m\n`;
+      else out += `Geolocation: (permission denied or unavailable)`;
+      document.getElementById('locationData').classList.remove('loading');
+      document.getElementById('locationData').textContent = out;
+    }
+
+    // ========== EMULATION DETECTION ==========
+    async function getEmulationInfo() {
+      let out = '';
+      let mediaDevices = [];
+      if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        try {
+          mediaDevices = await navigator.mediaDevices.enumerateDevices();
+          out += `Media devices: ${mediaDevices.length} (${mediaDevices.map(d=>d.kind).join(', ')})\n`;
+        } catch (e) {
+          out += `Media devices: not accessible (${e.message})\n`;
+        }
+      } else out += 'Media devices: not supported\n';
+      let glInfo = {};
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (gl) {
+          const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+          glInfo.vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : 'Unknown';
+          glInfo.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'Unknown';
+          glInfo.version = gl.getParameter(gl.VERSION);
+        }
+      } catch {}
+      out += `WebGL Vendor: ${glInfo.vendor||'n/a'}\nWebGL Renderer: ${glInfo.renderer||'n/a'}\nWebGL Version: ${glInfo.version||'n/a'}\n`;
+      out += `WebGPU: ${!!navigator.gpu}\n`;
+      out += `Window size: ${window.innerWidth}x${window.innerHeight}\n`;
+      if (document.fonts && document.fonts.size) {
+        let fontList = [];
+        document.fonts.forEach(f=>fontList.push(f.family));
+        out += `Fonts: ${fontList.length} loaded (sample: ${fontList.slice(0,5).join(', ')})\n`;
+      } else out += 'Fonts: API not supported or no fonts loaded\n';
+      let speechVoices = [];
+      if (window.speechSynthesis) {
+        speechVoices = window.speechSynthesis.getVoices();
+        out += `Speech Synthesis voices: ${speechVoices.length}\n`;
+      } else out += 'Speech Synthesis: not supported\n';
+      document.getElementById('emulation').classList.remove('loading');
+      document.getElementById('emulation').textContent = out;
+    }
+
+    // ========== NOISE DETECTION ==========
+    function hashString(str) {
+      let hash = 0, i, chr;
+      if (!str) return 0;
+      for (i = 0; i < str.length; i++) {
+        chr = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + chr;
+        hash |= 0;
+      }
+      return hash;
+    }
+
+    async function getNoise() {
+      let out = '';
+      let canvasHash = '';
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = 300; canvas.height = 60;
+        const ctx = canvas.getContext('2d');
+        ctx.textBaseline = 'top';
+        ctx.font = "18px 'Arial'";
+        ctx.fillStyle = '#f60';
+        ctx.fillRect(20, 10, 120, 30);
+        ctx.fillStyle = '#069';
+        ctx.fillText('canvas-fingerprint', 22, 24);
+        canvasHash = hashString(canvas.toDataURL());
+        out += `Canvas hash: ${canvasHash}\n`;
+      } catch { out += 'Canvas: not supported\n'; }
+      let audioHash = '';
+      try {
+        const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1,44100,44100);
+        const osc = ctx.createOscillator();
+        osc.type = 'triangle'; osc.frequency.value = 10000;
+        osc.connect(ctx.destination); osc.start(0);
+        ctx.startRendering();
+        ctx.oncomplete = e => {
+          const buf = e.renderedBuffer.getChannelData(0);
+          let sum = 0;
+          for (let i=0;i<buf.length;i++) sum += Math.abs(buf[i]);
+          audioHash = hashString(sum.toString());
+          out += `AudioContext hash: ${audioHash}\n`;
+          document.getElementById('noise').textContent = out;
+        };
+        return;
+      } catch { out += 'AudioContext: not supported\n'; }
+      let webglHash = '';
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = 128; canvas.height = 128;
+        const gl = canvas.getContext('webgl');
+        gl.clearColor(0.5, 0.4, 0.3, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        const pixels = new Uint8Array(128*128*4);
+        gl.readPixels(0,0,128,128,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
+        let sum = pixels.reduce((a,b)=>a+b,0);
+        webglHash = hashString(sum.toString());
+        out += `WebGL image hash: ${webglHash}\n`;
+      } catch { out += 'WebGL image: not supported\n'; }
+      let clientRect = '';
+      try {
+        const div = document.createElement('div');
+        div.style.position = 'absolute'; div.style.top = '0'; div.style.left = '0';
+        div.style.font = '18px Arial'; div.textContent = 'clientRects-fingerprint';
+        document.body.appendChild(div);
+        const rect = div.getBoundingClientRect();
+        clientRect = `${rect.width}x${rect.height}`;
+        out += `ClientRects (w x h): ${clientRect}\n`;
+        div.remove();
+      } catch { out += 'ClientRects: not supported\n'; }
+      document.getElementById('noise').classList.remove('loading');
+      document.getElementById('noise').textContent = out;
+    }
+
+    // ========== BOT/EMULATOR DETECTION ala fingerprints.com ==========
+    function isLikelyBot() {
+      const navigatorCheck = navigator.webdriver || false;
+      const headlessUserAgents = [/HeadlessChrome/, /PhantomJS/, /Selenium/, /Puppeteer/];
+      const suspiciousAgent = headlessUserAgents.some(rx => rx.test(navigator.userAgent));
+      const pluginsEmpty = navigator.plugins.length === 0;
+      const languagesMissing = !navigator.language;
+      const permissions = navigator.permissions && navigator.permissions.query ? true : false;
+      // Bisa ditambah heuristik lain sesuai kebutuhan
+      return navigatorCheck || suspiciousAgent || pluginsEmpty || languagesMissing;
+    }
+
+    function showBotStatus() {
+      const bot = isLikelyBot();
+      const el = document.getElementById('botStatus');
+      if (bot) {
+        el.textContent = '⚠️ Bot or Emulator detected';
+        el.className = 'bot';
+      } else {
+        el.textContent = '✅ Human device detected';
+        el.className = 'human';
+      }
+    }
+
+    getIPInfo();
+    getLocationData();
+    getEmulationInfo();
+    getNoise();
+    showBotStatus();
+  </script>
+</body>
+</html>
